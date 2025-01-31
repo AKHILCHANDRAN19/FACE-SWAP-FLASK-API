@@ -1,10 +1,10 @@
-Flask
 torch
 torchvision
-numpy
-Pillow
-opencv-python
 basicsr
-realesrgan
+facexlib
+gfpgan
+flask
+pillow
+numpy
 requests
 gunicorn==23.0.0
