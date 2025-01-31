@@ -1,98 +1,66 @@
-import os
-import torch
-import requests
-import numpy as np
-from flask import Flask, request, jsonify
+from flask import Flask, request, send_file
 from PIL import Image
-from io import BytesIO
+import torch
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from realesrgan import RealESRGANer
+import io
+import os
+import requests
+import numpy as np
 
-# === PATCHING BASICSR TO FIX IMPORT ERROR ===
-def patch_basicsr():
-    import sys
-    import fileinput
-
-    basicsr_path = next((p for p in sys.path if "basicsr" in p), None)
-    if basicsr_path:
-        degradations_file = os.path.join(basicsr_path, "data", "degradations.py")
-        if os.path.exists(degradations_file):
-            with fileinput.FileInput(degradations_file, inplace=True) as file:
-                for line in file:
-                    print(line.replace(
-                        "from torchvision.transforms.functional_tensor import rgb_to_grayscale",
-                        "from torchvision.transforms.functional import rgb_to_grayscale"
-                    ), end="")
-            print("Patched basicsr successfully!")
-
-patch_basicsr()
-
-# Flask app
 app = Flask(__name__)
 
-# Model URL and Path
-MODEL_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
-MODEL_PATH = "RealESRGAN_x4plus.pth"
+# Define the model path and the external URL
+model_path = 'weights/RealESRGAN_x4plus.pth'
+model_url = 'https://your-file-hosting-service.com/path/to/RealESRGAN_x4plus.pth'
 
-# Automatically download the model if not found
-if not os.path.exists(MODEL_PATH):
-    print("Downloading model...")
-    response = requests.get(MODEL_URL, stream=True)
-    with open(MODEL_PATH, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
-    print("Model downloaded successfully!")
+# Ensure the weights directory exists
+os.makedirs('weights', exist_ok=True)
 
-# Load Model
+# Download the model if it's not already present
+if not os.path.exists(model_path):
+    print("Model not found locally. Downloading...")
+    response = requests.get(model_url)
+    with open(model_path, 'wb') as f:
+        f.write(response.content)
+    print("Model downloaded successfully.")
+
+# Initialize the Real-ESRGAN model
 model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
 upsampler = RealESRGANer(
-    scale=4, 
-    model_path=MODEL_PATH, 
-    model=model, 
-    tile=0, 
-    tile_pad=10, 
-    pre_pad=0, 
-    half=True if torch.cuda.is_available() else False
+    scale=4,
+    model_path=model_path,
+    model=model,
+    tile=0,
+    tile_pad=10,
+    pre_pad=0,
+    half=True
 )
 
-# Allowed extensions
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
-
-# Function to check allowed file type
-def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-
-@app.route("/upscale", methods=["POST"])
+@app.route('/upscale', methods=['POST'])
 def upscale_image():
-    if "image" not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+    if 'image' not in request.files:
+        return 'No image file provided', 400
 
-    file = request.files["image"]
-
-    if file.filename == "":
-        return jsonify({"error": "No selected file"}), 400
-
-    if not allowed_file(file.filename):
-        return jsonify({"error": "Invalid file type"}), 400
-
+    file = request.files['image']
     try:
-        # Load and process image
-        img = Image.open(file).convert("RGB")
-        img_np = np.array(img)
-
-        # Perform upscaling
-        output, _ = upsampler.enhance(img_np, outscale=4)
-        output_img = Image.fromarray(output)
-
-        # Convert to bytes
-        img_io = BytesIO()
-        output_img.save(img_io, format="PNG")
-        img_io.seek(0)
-
-        return jsonify({"message": "Upscaling successful"}), 200
+        img = Image.open(file.stream).convert('RGB')
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return f'Invalid image file: {e}', 400
 
-# Run Flask app
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Process the image with Real-ESRGAN
+    img_np = np.array(img)
+    output, _ = upsampler.enhance(img_np, outscale=4)
+
+    # Convert the output to a PIL image
+    output_img = Image.fromarray(output)
+
+    # Save the output image to a BytesIO object
+    img_io = io.BytesIO()
+    output_img.save(img_io, format='PNG')
+    img_io.seek(0)
+
+    return send_file(img_io, mimetype='image/png')
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
