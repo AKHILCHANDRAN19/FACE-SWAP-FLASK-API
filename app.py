@@ -8,6 +8,25 @@ from io import BytesIO
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from realesrgan import RealESRGANer
 
+# === PATCHING BASICSR TO FIX IMPORT ERROR ===
+def patch_basicsr():
+    import sys
+    import fileinput
+
+    basicsr_path = next((p for p in sys.path if "basicsr" in p), None)
+    if basicsr_path:
+        degradations_file = os.path.join(basicsr_path, "data", "degradations.py")
+        if os.path.exists(degradations_file):
+            with fileinput.FileInput(degradations_file, inplace=True) as file:
+                for line in file:
+                    print(line.replace(
+                        "from torchvision.transforms.functional_tensor import rgb_to_grayscale",
+                        "from torchvision.transforms.functional import rgb_to_grayscale"
+                    ), end="")
+            print("Patched basicsr successfully!")
+
+patch_basicsr()
+
 # Flask app
 app = Flask(__name__)
 
