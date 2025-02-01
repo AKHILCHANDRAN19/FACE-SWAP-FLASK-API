@@ -1,133 +1,124 @@
-# app.py
 import os
+import sys
+import io
 import cv2
+import torch
+import types
+import requests
 import numpy as np
-from flask import Flask, request, send_file
-from werkzeug.utils import secure_filename
-import insightface
-from insightface.app import FaceAnalysis
-import gdown
-from io import BytesIO
-import zipfile
+from PIL import Image
+from flask import Flask, request, render_template_string, send_file
 
-# Configure for low memory usage
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+# Fix for torchvision.transforms.functional_tensor
+if "torchvision.transforms.functional_tensor" not in sys.modules:
+    import torchvision.transforms.functional as F
+    dummy = types.ModuleType("torchvision.transforms.functional_tensor")
+    dummy.rgb_to_grayscale = F.rgb_to_grayscale
+    sys.modules["torchvision.transforms.functional_tensor"] = dummy
+
+# Import RealESRGANer and RRDBNet after fixing the issue
+from realesrgan import RealESRGANer
+from basicsr.archs.rrdbnet_arch import RRDBNet
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB limit
 
-# Initialize models with CPU-only and reduced precision
-print("🚀 Initializing face analysis model...")
-face_app = FaceAnalysis(
-    name='buffalo_l',
-    providers=['CPUExecutionProvider']
-)
-face_app.prepare(ctx_id=-1, det_size=(320, 320))  # Reduced input size
+# Constants
+MODEL_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+MODEL_PATH = "weights/RealESRGAN_x4.pth"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Model setup
-MODEL_PATH = 'inswapper_128.onnx'
-if not os.path.exists(MODEL_PATH):
-    print("📥 Downloading face swap model...")
-    gdown.download(
-        'https://drive.google.com/uc?id=1krOLgjW2tAPaqV-Bw4YALz0xT5zlb5HF',
-        MODEL_PATH,
-        quiet=False
+def download_model():
+    """Download the model if it doesn't exist"""
+    if not os.path.exists(MODEL_PATH):
+        print("Downloading model...")
+        os.makedirs("weights", exist_ok=True)
+        response = requests.get(MODEL_URL, stream=True)
+        with open(MODEL_PATH, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print("Model downloaded successfully!")
+
+def initialize_model():
+    """Initialize the Real-ESRGAN model"""
+    download_model()
+    
+    return RealESRGANer(
+        scale=4,
+        model_path=MODEL_PATH,
+        model=RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32),
+        tile=0,
+        tile_pad=10,
+        pre_pad=0,
+        half=True if DEVICE == "cuda" else False
     )
 
-print("⚙️ Loading swapper model...")
-swapper = insightface.model_zoo.get_model(
-    MODEL_PATH,
-    download=False,
-    providers=['CPUExecutionProvider']
-)
+# Initialize model
+model = initialize_model()
+model.model.to(DEVICE)
 
-def validate_image(file_stream):
-    """Validate image using magic numbers"""
-    header = file_stream.read(4)
-    file_stream.seek(0)
-    if header.startswith(b'\xff\xd8\xff'):
-        return 'jpg'
-    elif header.startswith(b'\x89PNG'):
-        return 'png'
-    elif header[:2] == b'\xff\xd8':
-        return 'jpeg'
-    else:
-        raise ValueError("Unsupported image format")
+# Global variable to hold the upscaled image
+upscaled_image = None
 
-def swap_faces(img1_bytes, img2_bytes):
-    """Perform face swap with memory optimization"""
-    # Convert bytes to numpy arrays
-    img1 = cv2.imdecode(np.frombuffer(img1_bytes, np.uint8), cv2.IMREAD_COLOR)
-    img2 = cv2.imdecode(np.frombuffer(img2_bytes, np.uint8), cv2.IMREAD_COLOR)
+# HTML Template
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Real-ESRGAN Image Upscaler</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; background: #f5f5f5; margin-top: 50px; }
+    .container { margin: auto; padding: 20px; width: 500px; background: white; border-radius: 8px; box-shadow: 0px 0px 10px rgba(0,0,0,0.1); }
+    input { margin: 10px 0; }
+    button { padding: 10px 20px; background: #4285f4; color: white; border: none; border-radius: 5px; cursor: pointer; }
+    img { margin-top: 20px; max-width: 100%; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Real-ESRGAN Image Upscaler</h1>
+    <form method="post" enctype="multipart/form-data">
+      <input type="file" name="image" accept="image/*" required>
+      <br>
+      <button type="submit">Upload &amp; Upscale</button>
+    </form>
+    {% if upscaled %}
+      <h2>Upscaled Image</h2>
+      <img src="{{ url_for('get_upscaled_image') }}" alt="Upscaled Image">
+      <br>
+      <a href="{{ url_for('get_upscaled_image') }}" download="upscaled.jpg">
+        <button>Download Image</button>
+      </a>
+    {% endif %}
+  </div>
+</body>
+</html>
+"""
 
-    # Detect faces (using first face found)
-    face1 = face_app.get(img1)
-    face2 = face_app.get(img2)
-    
-    if not face1:
-        raise ValueError("❌ No face detected in first image")
-    if not face2:
-        raise ValueError("❌ No face detected in second image")
+@app.route("/", methods=["GET", "POST"])
+def index():
+    global upscaled_image
+    upscaled_image = None
+    if request.method == "POST":
+        file = request.files.get("image")
+        if file:
+            img = Image.open(file.stream).convert("RGB")
+            img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            output, _ = model.enhance(img_cv, outscale=4)
+            output = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
+            result = Image.fromarray(output)
+            img_io = io.BytesIO()
+            result.save(img_io, "JPEG")
+            img_io.seek(0)
+            upscaled_image = img_io
 
-    # Perform swap with garbage collection
-    result1 = swapper.get(img1, face1[0], face2[0], paste_back=True)
-    result2 = swapper.get(img2, face2[0], face1[0], paste_back=True)
-    
-    # Release memory
-    del img1, img2, face1, face2
-    
-    return result1, result2
+    return render_template_string(HTML_TEMPLATE, upscaled=(upscaled_image is not None))
 
-@app.route('/swap', methods=['POST'])
-def handle_swap():
-    try:
-        if 'image1' not in request.files or 'image2' not in request.files:
-            return {"error": "Missing image files"}, 400
+@app.route("/upscaled")
+def get_upscaled_image():
+    if upscaled_image:
+        return send_file(upscaled_image, mimetype="image/jpeg")
+    return "No image has been upscaled yet.", 404
 
-        # Process files directly from memory
-        file1 = request.files['image1']
-        file2 = request.files['image2']
-
-        # Validate images
-        for f in [file1, file2]:
-            f.stream.seek(0)
-            try:
-                validate_image(f.stream)
-            except ValueError as e:
-                return {"error": str(e)}, 400
-
-        # Read bytes
-        img1_bytes = file1.read()
-        img2_bytes = file2.read()
-
-        # Process
-        result1, result2 = swap_faces(img1_bytes, img2_bytes)
-
-        # Create in-memory ZIP file
-        mem_zip = BytesIO()
-        with zipfile.ZipFile(mem_zip, 'w') as zf:
-            # Convert images to bytes
-            _, img1_bytes = cv2.imencode('.jpg', result1)
-            _, img2_bytes = cv2.imencode('.jpg', result2)
-            
-            zf.writestr('swapped_1.jpg', img1_bytes.tobytes())
-            zf.writestr('swapped_2.jpg', img2_bytes.tobytes())
-
-        mem_zip.seek(0)
-        
-        # Clean up
-        del result1, result2, img1_bytes, img2_bytes
-
-        return send_file(
-            mem_zip,
-            mimetype='application/zip',
-            as_attachment=True,
-            download_name='swapped_results.zip'
-        )
-
-    except Exception as e:
-        return {"error": str(e)}, 500
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+if __name__ == "__main__":
+    app.run(debug=True)
