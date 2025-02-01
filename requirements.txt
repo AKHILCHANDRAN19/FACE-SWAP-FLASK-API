@@ -2,9 +2,8 @@
 flask==2.3.3
 gdown==4.6.6
 numpy==1.24.4
-opencv-python==4.8.0.76
+opencv-python-headless==4.8.0.76
 insightface==0.7.3
-onnx==1.14.1
 onnxruntime==1.15.1
 Pillow==10.0.1
 werkzeug==2.3.7
